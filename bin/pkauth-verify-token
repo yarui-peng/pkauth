@@ -16,6 +16,7 @@ ADMIN_PUBLIC_KEY=
 
 usage() {
     printf 'Usage: %s <username>\n' "$0"
+    printf '       %s --preflight <target_user> <manager_gid> <token_dir> <log_file>\n' "$0"
     printf 'Defaults:\n'
     printf '  TOKEN_DIR: /var/run/pkauth\n'
     printf '  NAMESPACE: pkauth@e3da.local\n'
@@ -50,9 +51,58 @@ secure_config_file() {
     [ -f "$1" ] || return 1
     secure_mode "$1"
 }
+
+preflight() {
+    target_user=$1
+    manager_gid=$2
+    token_dir=$3
+    log_file=$4
+
+    mkdir -p -- "$token_dir" "$(dirname -- "$log_file")"
+    touch -- "$log_file"
+    chmod 0755 -- "$token_dir"
+    chmod 0640 -- "$log_file"
+    entry=$(getent passwd "$target_user") || {
+        echo 'target account does not exist' >&2
+        return 1
+    }
+    primary_gid=$(printf '%s\n' "$entry" | cut -d: -f4)
+    members=$(getent group "$manager_gid" | cut -d: -f4-)
+    case ",$members," in
+        *,"$target_user",*) ;;
+        *) [ "$primary_gid" = "$manager_gid" ] || {
+            printf '%s ERROR user=%s reason=not-in-manager-gid gid=%s\n' \
+                "$(date +%FT%T%z)" "$target_user" "$manager_gid" >> "$log_file"
+            echo 'target account is not in manager group' >&2
+            return 1
+        } ;;
+    esac
+    [ -x "$PKAUTH_ROOT/bin/pkauth-verify-token" ] || {
+        echo "remote verifier is not executable: $PKAUTH_ROOT/bin/pkauth-verify-token" >&2
+        return 1
+    }
+    protect_home=$(systemctl show polkit.service -p ProtectHome --value 2>/dev/null || true)
+    case "$protect_home" in
+        yes|tmpfs)
+            echo "Warning: polkit.service ProtectHome=$protect_home may hide $PKAUTH_ROOT/bin/pkauth-verify-token from polkitd" >&2
+            echo 'Set ProtectHome=read-only in a polkit systemd override and restart polkit.' >&2
+            ;;
+    esac
+    if command -v runuser >/dev/null 2>&1; then
+        runuser -u polkitd -- "$PKAUTH_ROOT/bin/pkauth-verify-token" >/dev/null 2>&1 || {
+            echo "Warning: polkitd cannot execute or read the verifier/config: $PKAUTH_ROOT/bin/pkauth-verify-token" >&2
+        }
+    fi
+}
+
 if [ -e "$CONFIG" ]; then
     secure_config_file "$CONFIG" || exit 1
     . "$CONFIG"
+fi
+if [ "${1-}" = '--preflight' ]; then
+    [ "$#" -eq 5 ] || exit 1
+    preflight "$2" "$3" "$4" "$5"
+    exit $?
 fi
 if [ "$#" -eq 0 ]; then
     usage
@@ -76,7 +126,7 @@ IFS= read -r expiration < "$token" || exit 1
 case "$expiration" in ''|*[!0-9]*) exit 1 ;; esac
 printf '%s\n' "$expiration" > "$payload"
 tail -n +2 "$token" > "$signature"
-printf '%s %s pkauth signing key\n' "$IDENTITY" "$ADMIN_PUBLIC_KEY" > "$work/allowed_signers"
+printf '%s %s\n' "$IDENTITY" "$ADMIN_PUBLIC_KEY" > "$work/allowed_signers"
 /usr/bin/ssh-keygen -Y verify -f "$work/allowed_signers" -I "$IDENTITY" \
     -n "$NAMESPACE" -s "$signature" < "$payload" >/dev/null 2>&1 || exit 1
 printf '%s\n' "$expiration"

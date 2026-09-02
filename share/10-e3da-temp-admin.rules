@@ -1,3 +1,6 @@
+//author Yarui
+//version 09/02/26
+
 polkit.addRule(function(action, subject) {
     var PKAUTH_ROOT = "/home/root/e3da/pkauth";
     var VERIFIER = PKAUTH_ROOT + "/bin/pkauth-verify-token";

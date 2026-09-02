@@ -7,22 +7,23 @@ set -euo pipefail
 TOKEN_DIR=/var/run/pkauth
 LOG_FILE=/var/log/e3da/pkauth.log
 PKAUTH_ROOT=/home/root/e3da/pkauth
-SSH_KEY_DIR=/home/root/.ssh/keys
+SSH_KEY_DIR="${HOME:-/root}/.ssh/keys"
 SSH_PORT=10022
 MANAGER_GID=7000
 IDENTITY=admin@e3da.local
 NAMESPACE="pkauth@e3da.local"
 MAX_HOURS=24
 
-TARGET_HOST="${1:-}"
-TARGET_USER="${2:-}"
+TARGET_USER="${1:-}"
+SSH_DESTINATION="${2:-root@localhost}"
 HOURS_VALID=3
 
 usage() {
-    printf 'Usage: %s <target_host> <username> [hours] [ssh_port] [identity] [ssh_key_dir]\n' "$0"
+    printf 'Usage: %s <target_user> [ssh_user@host] [hours] [ssh_port] [identity] [ssh_key_dir]\n' "$0"
     printf 'Defaults:\n'
     printf '  hours:     %s (maximum %s)\n' "$HOURS_VALID" "$MAX_HOURS"
-    printf '  ssh_port:  %s\n' "$SSH_PORT"
+    printf '  ssh destination: %s\n' "$SSH_DESTINATION"
+    printf '  ssh port:  %s\n' "$SSH_PORT"
     printf '  manager GID: %s\n' "$MANAGER_GID"
     printf '  identity:  %s\n' "$IDENTITY"
     printf '  ssh key dir: %s\n' "$SSH_KEY_DIR"
@@ -32,13 +33,13 @@ usage() {
     printf '  PKAUTH_ROOT: %s\n' "$PKAUTH_ROOT"
 }
 
-if (( EUID != 0 )); then
-    printf '%s\n' 'Error: this command must run as root (use sudo)' >&2
-    exit 1
+if (( $# == 0 )); then
+    usage
+    exit 0
 fi
 
-if [[ -z "$TARGET_HOST" || -z "$TARGET_USER" ]]; then
-    usage >&2
+if (( EUID != 0 )); then
+    printf '%s\n' 'Error: this command must run as root (use sudo)' >&2
     exit 1
 fi
 
@@ -55,13 +56,23 @@ if [[ -n "${6:-}" ]]; then
     SSH_KEY_DIR=$6
 fi
 
+if [[ "$SSH_DESTINATION" == *@* ]]; then
+    SSH_USER=${SSH_DESTINATION%@*}
+    TARGET_HOST=${SSH_DESTINATION#*@}
+else
+    SSH_USER=root
+    TARGET_HOST=$SSH_DESTINATION
+fi
+
 if [[ ! "$TARGET_USER" =~ ^[a-zA-Z_][a-zA-Z0-9_-]*$ ||
       ! "$HOURS_VALID" =~ ^([1-9][0-9]*)(\.[0-9]+)?$ ||
       ! "$MANAGER_GID" =~ ^[1-9][0-9]*$ ||
       ! "$SSH_PORT" =~ ^[1-9][0-9]*$ ||
       ! "$IDENTITY" =~ ^[a-zA-Z0-9_.@-]+$ ||
-      ! "$SSH_KEY_DIR" =~ ^[a-zA-Z0-9_./-]+$ ]]; then
-    printf '%s\n' 'Error: invalid username, duration, SSH port, identity, or key directory' >&2
+            ! "$SSH_KEY_DIR" =~ ^[a-zA-Z0-9_./-]+$ ||
+            ! "$SSH_USER" =~ ^[a-zA-Z_][a-zA-Z0-9_-]*$ ||
+            ! "$TARGET_HOST" =~ ^[a-zA-Z0-9_.:-]+$ ]]; then
+        printf '%s\n' 'Error: invalid user, host, duration, SSH port, identity, or key directory' >&2
     exit 1
 fi
 
@@ -71,7 +82,17 @@ if (( $(awk "BEGIN { print ($HOURS_VALID > $MAX_HOURS) }") )); then
 fi
 
 SSH_KEY="$SSH_KEY_DIR/$IDENTITY"
-[[ -f "$SSH_KEY" ]] || { printf 'Error: SSH key missing: %s\n' "$SSH_KEY" >&2; exit 1; }
+[[ -d "$SSH_KEY_DIR" && -r "$SSH_KEY_DIR" ]] || {
+    printf 'Error: SSH key directory is missing or unreadable: %s\n' "$SSH_KEY_DIR" >&2
+    exit 1
+}
+[[ -f "$SSH_KEY" && -r "$SSH_KEY" ]] || {
+    printf 'Error: SSH identity file is missing or unreadable: %s\n' "$SSH_KEY" >&2
+    exit 1
+}
+PUBLIC_KEY=$(ssh-keygen -y -f "$SSH_KEY")
+printf 'SSH key used: %s\n' "$SSH_KEY"
+printf 'Public key derived from SSH key: %s\n' "$PUBLIC_KEY"
 EXPIRATION_EPOCH=$(date -u -d "+${HOURS_VALID} hours" +%s%3N)
 HUMAN_EXPIRATION=$(date -d "@$((${EXPIRATION_EPOCH} / 1000))" +%FT%T%z)
 WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/pkauth.XXXXXX")
@@ -82,37 +103,25 @@ ssh-keygen -Y sign -f "$SSH_KEY" -n "$NAMESPACE" "$PAYLOAD" >/dev/null 2>&1
 SIGNATURE="$PAYLOAD.sig"
 
 printf 'Checking %s belongs to manager GID %s...\n' "$TARGET_USER" "$MANAGER_GID"
-ssh -p "$SSH_PORT" -i "$SSH_KEY" -o BatchMode=yes "root@$TARGET_HOST" \
-    /bin/sh -s -- "$TARGET_USER" "$MANAGER_GID" "$PKAUTH_ROOT/bin/pkauth-verify-token" "$TOKEN_DIR" "$LOG_FILE" <<'REMOTE_CHECK'
-set -eu
-user=$1
-gid=$2
-verifier=$3
-token_dir=$4
-log_file=$5
-mkdir -p -- "$token_dir" "$(dirname -- "$log_file")"
-touch -- "$log_file"
-chmod 0755 -- "$token_dir"
-chmod 0640 -- "$log_file"
-entry=$(getent passwd "$user") || { echo "target account does not exist" >&2; exit 1; }
-primary_gid=$(printf '%s\n' "$entry" | cut -d: -f4)
-members=$(getent group "$gid" | cut -d: -f4-)
-case ",${members}," in
-    *,"$user",*) ;;
-    *) [ "$primary_gid" = "$gid" ] || {
-        printf '%s ERROR user=%s reason=not-in-manager-gid gid=%s\n' "$(date +%FT%T%z)" "$user" "$gid" >> "$log_file"
-        echo "target account is not in manager group" >&2
-        exit 1
-    } ;;
-esac
-[ -x "$verifier" ] || { echo "remote verifier is not executable" >&2; exit 1; }
-REMOTE_CHECK
+VERIFIER="$PKAUTH_ROOT/bin/pkauth-verify-token"
+printf -v preflight_command '%q --preflight %q %q %q %q' \
+    "$VERIFIER" "$TARGET_USER" "$MANAGER_GID" "$TOKEN_DIR" "$LOG_FILE"
+if [[ "$SSH_USER" == root ]]; then
+    printf -v remote_preflight '/bin/sh -c %q' "$preflight_command"
+else
+    printf -v remote_preflight 'sudo -n /bin/sh -c %q' "$preflight_command"
+fi
+ssh -p "$SSH_PORT" -i "$SSH_KEY" -o BatchMode=yes "$SSH_DESTINATION" "$remote_preflight"
 
 printf 'Publishing signed token...\n'
 printf -v remote_publish 'set -eu; token_dir=%q; log_file=%q; user=%q; identity=%q; starts=%q; expires=%q; tmp=$(mktemp "$token_dir/.token.XXXXXX"); trap '\''rm -f "$tmp"'\'' EXIT HUP INT TERM; cat > "$tmp"; chmod 0644 "$tmp"; mv -f -- "$tmp" "$token_dir/$user.token"; printf '\''%%s INFO authenticated_by=%%s authenticated_user=%%s starts=%%s expires=%%s\\n'\'' "$(date +%%FT%%T%%z)" "$identity" "$user" "$starts" "$expires" >> "$log_file"; logger -t pkauth -- "authenticated_by=$identity authenticated_user=$user starts=$starts expires=$expires"' \
     "$TOKEN_DIR" "$LOG_FILE" "$TARGET_USER" "$IDENTITY" "$(date +%FT%T%z)" "$HUMAN_EXPIRATION"
-printf -v remote_invocation '/bin/sh -c %q' "$remote_publish"
-ssh -p "$SSH_PORT" -i "$SSH_KEY" -o BatchMode=yes "root@$TARGET_HOST" "$remote_invocation" \
+if [[ "$SSH_USER" == root ]]; then
+    printf -v remote_invocation '/bin/sh -c %q' "$remote_publish"
+else
+    printf -v remote_invocation 'sudo -n /bin/sh -c %q' "$remote_publish"
+fi
+ssh -p "$SSH_PORT" -i "$SSH_KEY" -o BatchMode=yes "$SSH_DESTINATION" "$remote_invocation" \
     < <(cat "$PAYLOAD" "$SIGNATURE")
 
 printf "Success: user '%s' authorized on '%s' until %s.\n" "$TARGET_USER" "$TARGET_HOST" "$HUMAN_EXPIRATION"
