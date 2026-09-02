@@ -1,0 +1,3 @@
+*.sig
+*.token
+pkauth.conf

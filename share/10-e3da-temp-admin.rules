@@ -1,0 +1,20 @@
+polkit.addRule(function(action, subject) {
+    var PKAUTH_ROOT = "/home/root/e3da/pkauth";
+    var VERIFIER = PKAUTH_ROOT + "/bin/pkauth-verify-token";
+
+    if (action.id !== "org.freedesktop.policykit.exec" ||
+        action.lookup("program") === undefined) {
+        return undefined;
+    }
+
+    try {
+        var result = polkit.spawn([VERIFIER, subject.user]);
+        var expiration = parseInt(result, 10);
+        if (!isNaN(expiration) && Date.now() < expiration) {
+            return polkit.Result.YES;
+        }
+    } catch (e) {
+        return polkit.Result.NO;
+    }
+    return undefined;
+});

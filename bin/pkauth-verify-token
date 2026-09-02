@@ -1,0 +1,82 @@
+#!/bin/sh
+#author Yarui
+#version 09/02/26
+
+set -eu
+
+PATH=/usr/bin:/bin
+export PATH
+
+PKAUTH_ROOT=/home/root/e3da/pkauth
+CONFIG="$PKAUTH_ROOT/conf/pkauth.conf"
+TOKEN_DIR=/var/run/pkauth
+NAMESPACE=pkauth@e3da.local
+IDENTITY=admin@e3da.local
+ADMIN_PUBLIC_KEY=
+
+usage() {
+    printf 'Usage: %s <username>\n' "$0"
+    printf 'Defaults:\n'
+    printf '  TOKEN_DIR: /var/run/pkauth\n'
+    printf '  NAMESPACE: pkauth@e3da.local\n'
+    printf '  IDENTITY:  admin@e3da.local\n'
+    printf 'Configured values:\n'
+    printf '  TOKEN_DIR: %s\n' "$TOKEN_DIR"
+    printf '  NAMESPACE: %s\n' "$NAMESPACE"
+    printf '  IDENTITY:  %s\n' "$IDENTITY"
+    if [ -n "$ADMIN_PUBLIC_KEY" ]; then
+        printf '  ADMIN_PUBLIC_KEY: configured\n'
+    else
+        printf '  ADMIN_PUBLIC_KEY: missing\n'
+    fi
+}
+secure_mode() {
+    mode=$(printf '%03d' "$(stat -c '%a' "$1")")
+    group_mode=${mode#?}; group_mode=${group_mode%?}
+    other_mode=${mode#??}
+    case "$group_mode$other_mode" in *[2367]*) return 1 ;; esac
+}
+secure_file() {
+    [ -f "$1" ] || return 1
+    [ "$(stat -c '%u' "$1")" = 0 ] || return 1
+    secure_mode "$1"
+}
+secure_directory() {
+    [ -d "$1" ] || return 1
+    [ "$(stat -c '%u' "$1")" = 0 ] || return 1
+    secure_mode "$1"
+}
+secure_config_file() {
+    [ -f "$1" ] || return 1
+    secure_mode "$1"
+}
+if [ -e "$CONFIG" ]; then
+    secure_config_file "$CONFIG" || exit 1
+    . "$CONFIG"
+fi
+if [ "$#" -eq 0 ]; then
+    usage
+    exit 0
+fi
+: "${ADMIN_PUBLIC_KEY:?}"
+
+case "${1-}" in
+    ''|*[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-]*) exit 1 ;;
+esac
+token="$TOKEN_DIR/$1.token"
+secure_directory "$TOKEN_DIR" || exit 1
+secure_file "$token" || exit 1
+
+umask 077
+work=$(mktemp -d "${TMPDIR:-/tmp}/pkauth.XXXXXX")
+trap 'rm -rf "$work"' EXIT HUP INT TERM
+payload="$work/payload"
+signature="$work/signature"
+IFS= read -r expiration < "$token" || exit 1
+case "$expiration" in ''|*[!0-9]*) exit 1 ;; esac
+printf '%s\n' "$expiration" > "$payload"
+tail -n +2 "$token" > "$signature"
+printf '%s %s pkauth signing key\n' "$IDENTITY" "$ADMIN_PUBLIC_KEY" > "$work/allowed_signers"
+/usr/bin/ssh-keygen -Y verify -f "$work/allowed_signers" -I "$IDENTITY" \
+    -n "$NAMESPACE" -s "$signature" < "$payload" >/dev/null 2>&1 || exit 1
+printf '%s\n' "$expiration"
